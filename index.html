@@ -354,8 +354,27 @@
 
     .input-actions {
       display: flex;
+      align-items: center;
       gap: 0.75rem;
       margin-top: 0.75rem;
+      flex-wrap: wrap;
+    }
+
+    .file-input {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    .file-input:focus-visible + .btn-text {
+      outline: 2px solid var(--accent);
+      outline-offset: 3px;
     }
 
     .btn-text {
@@ -561,6 +580,8 @@
       <h2>Use your own text</h2>
       <textarea id="userText" placeholder="Paste your notes, an article, or any text here…"></textarea>
       <div class="input-actions">
+        <input class="file-input" type="file" id="fileInput" accept=".txt,text/plain" />
+        <label class="btn-text" for="fileInput">Open .txt file</label>
         <button class="btn-text primary" id="btnLoad">Load &amp; Read</button>
         <button class="btn-text" id="btnClear">Clear</button>
       </div>
@@ -604,33 +625,77 @@
     const userText     = document.getElementById('userText');
     const btnLoad      = document.getElementById('btnLoad');
     const btnClear     = document.getElementById('btnClear');
+    const fileInput    = document.getElementById('fileInput');
 
 
     // ── 2. State variables ────────────────────────────────
+    const STORAGE_KEY = 'tts-reader-state';
+    const WORDS_PER_CHUNK = 40;
+    const CHARACTERS_PER_CHUNK = 180;
     let words       = [];       // array of all word elements in textDisplay
     let currentWord = 0;        // index of the word currently being spoken
     let isPlaying   = false;    // are we currently speaking?
     let utterance   = null;     // the SpeechSynthesisUtterance object
     let voices      = [];       // available voices from the browser
+    let speechSession = 0;
+    let savedVoiceURI = '';
+
+    function saveState() {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({
+          draftText: userText.value,
+          activeText: textDisplay.innerText,
+          speed: speedSlider.value,
+          pitch: pitchSlider.value,
+          voiceURI: voices.find((voice) => voice.voiceURI === voiceSelect.value)?.voiceURI || savedVoiceURI
+        }));
+      } catch (error) {
+        console.warn('Unable to save reader settings:', error);
+      }
+    }
+
+    function restoreState() {
+      try {
+        const savedState = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
+        if (!savedState) return;
+
+        if (typeof savedState.draftText === 'string') userText.value = savedState.draftText;
+        if (typeof savedState.activeText === 'string' && savedState.activeText.trim()) {
+          textDisplay.textContent = savedState.activeText;
+        }
+        if (Number.isFinite(Number(savedState.speed)) && Number(savedState.speed) >= 0.5 && Number(savedState.speed) <= 2) {
+          speedSlider.value = savedState.speed;
+          speedVal.textContent = parseFloat(savedState.speed).toFixed(1) + '×';
+        }
+        if (Number.isFinite(Number(savedState.pitch)) && Number(savedState.pitch) >= 0.5 && Number(savedState.pitch) <= 2) {
+          pitchSlider.value = savedState.pitch;
+          pitchVal.textContent = parseFloat(savedState.pitch).toFixed(1);
+        }
+        if (typeof savedState.voiceURI === 'string') savedVoiceURI = savedState.voiceURI;
+      } catch (error) {
+        console.warn('Unable to restore reader settings:', error);
+      }
+    }
 
 
     // ── 3. Split text into word <span>s ──────────────────
     // We take the raw text, split by spaces, wrap each word in a <span class="word">
     // so JavaScript can highlight each word as it's spoken.
     function buildWordSpans() {
-      const rawText = textDisplay.innerText.trim();
+      const tokens = textDisplay.textContent.trim().split(/\s+/).filter(Boolean);
+      const fragment = document.createDocumentFragment();
 
-      // Split on whitespace — each chunk is one "word"
-      const tokens = rawText.split(/\s+/);
+      tokens.forEach((word, index) => {
+        if (index > 0) fragment.append(' ');
+        const span = document.createElement('span');
+        span.className = 'word';
+        span.dataset.index = index;
+        span.textContent = word;
+        span.addEventListener('click', () => seekToWord(index));
+        fragment.append(span);
+      });
 
-      // Build the HTML: each word becomes a clickable span
-      textDisplay.innerHTML = tokens
-        .map((word, i) =>
-          `<span class="word" data-index="${i}" onclick="seekToWord(${i})">${word}</span>`
-        )
-        .join(' ');
-
-      // Cache all word elements for quick access
+      textDisplay.replaceChildren(fragment);
       words = Array.from(textDisplay.querySelectorAll('.word'));
 
       // Update progress display
@@ -644,11 +709,14 @@
     function loadVoices() {
       voices = window.speechSynthesis.getVoices();
 
-      if (voices.length === 0) return; // not ready yet
+      if (voices.length === 0) return;
 
       voiceSelect.innerHTML = voices
-        .map((v, i) => `<option value="${i}">${v.name} (${v.lang})</option>`)
+        .map((v) => `<option value="${v.voiceURI}">${v.name} (${v.lang})</option>`)
         .join('');
+      if (savedVoiceURI && voices.some((voice) => voice.voiceURI === savedVoiceURI)) {
+        voiceSelect.value = savedVoiceURI;
+      }
     }
 
     // This event fires when voices are ready
@@ -686,62 +754,79 @@
 
     // ── 7. Speak from a given word index ─────────────────
     function speakFrom(startIndex) {
-      // Cancel any speech already happening
+      speechSession += 1;
+      const session = speechSession;
       window.speechSynthesis.cancel();
+      speakChunk(startIndex, session);
+    }
 
-      // Build a string from startIndex onwards
-      const textToSpeak = words.slice(startIndex).map(w => w.textContent).join(' ');
+    function speakChunk(startIndex, session) {
+      if (session !== speechSession) return;
 
-      if (!textToSpeak.trim()) return;
+      let chunkEnd = startIndex;
+      let chunkLength = 0;
+      while (chunkEnd < words.length && chunkEnd - startIndex < WORDS_PER_CHUNK) {
+        const nextLength = words[chunkEnd].textContent.length + (chunkEnd > startIndex ? 1 : 0);
+        if (chunkEnd > startIndex && chunkLength + nextLength > CHARACTERS_PER_CHUNK) break;
+        chunkLength += nextLength;
+        chunkEnd += 1;
+      }
+      const chunkWords = words.slice(startIndex, chunkEnd);
+      const textToSpeak = chunkWords.map((word) => word.textContent).join(' ');
+      if (!textToSpeak.trim()) {
+        finishSpeech(session);
+        return;
+      }
 
-      // Create a new utterance (this is the core Web Speech API object)
       utterance = new SpeechSynthesisUtterance(textToSpeak);
-
-      // Apply settings from sliders
       utterance.rate  = parseFloat(speedSlider.value);
       utterance.pitch = parseFloat(pitchSlider.value);
 
-      // Apply selected voice
-      const selectedVoice = voices[parseInt(voiceSelect.value)];
+      const selectedVoice = voices.find((voice) => voice.voiceURI === voiceSelect.value);
       if (selectedVoice) utterance.voice = selectedVoice;
 
-      // onboundary fires each time a new word starts
-      // We use it to move the highlight forward
       utterance.onboundary = (event) => {
-        if (event.name === 'word') {
-          // Count which word in our slice is being spoken
+        if (session === speechSession && event.name === 'word') {
           const spokenText = textToSpeak.substring(0, event.charIndex);
           const spokenWordCount = spokenText.trim().split(/\s+/).filter(Boolean).length;
-          highlightWord(startIndex + spokenWordCount);
+          highlightWord(Math.min(startIndex + spokenWordCount, chunkEnd - 1));
         }
       };
 
-      // onend fires when speech finishes naturally
       utterance.onend = () => {
-        isPlaying = false;
-        setStatus('idle');
-        showPlayIcon();
-        // Highlight last word briefly, then clear
-        setTimeout(() => {
-          words.forEach(w => w.classList.remove('active'));
-          progressBar.value = words.length;
-          progressText.textContent = `${words.length} / ${words.length} words`;
-        }, 600);
+        if (session !== speechSession) return;
+        if (chunkEnd < words.length) {
+          speakChunk(chunkEnd, session);
+        } else {
+          finishSpeech(session);
+        }
       };
 
-      // onerror fires if something goes wrong
       utterance.onerror = (e) => {
-        if (e.error !== 'interrupted') console.error('Speech error:', e.error);
+        if (session !== speechSession || e.error === 'interrupted') return;
+        console.error('Speech error:', e.error);
         setStatus('idle');
         isPlaying = false;
         showPlayIcon();
       };
 
-      // Start speaking!
       window.speechSynthesis.speak(utterance);
       isPlaying = true;
       setStatus('reading');
       showPauseIcon();
+    }
+
+    function finishSpeech(session) {
+      if (session !== speechSession) return;
+      isPlaying = false;
+      setStatus('idle');
+      showPlayIcon();
+      setTimeout(() => {
+        if (session !== speechSession) return;
+        words.forEach((word) => word.classList.remove('active'));
+        progressBar.value = words.length;
+        progressText.textContent = `${words.length} / ${words.length} words`;
+      }, 600);
     }
 
 
@@ -771,6 +856,7 @@
 
     // ── 9. Stop ───────────────────────────────────────────
     function stopSpeech() {
+      speechSession += 1;
       window.speechSynthesis.cancel();
       isPlaying   = false;
       currentWord = 0;
@@ -805,36 +891,58 @@
     // ── 13. Slider live updates ───────────────────────────
     speedSlider.addEventListener('input', () => {
       speedVal.textContent = parseFloat(speedSlider.value).toFixed(1) + '×';
+      saveState();
       // If currently speaking, restart from current word with new rate
       if (isPlaying) speakFrom(currentWord);
     });
 
     pitchSlider.addEventListener('input', () => {
       pitchVal.textContent = parseFloat(pitchSlider.value).toFixed(1);
+      saveState();
       if (isPlaying) speakFrom(currentWord);
     });
 
+    voiceSelect.addEventListener('change', saveState);
+    userText.addEventListener('input', saveState);
 
     // ── 14. Load user's custom text ───────────────────────
-    btnLoad.addEventListener('click', () => {
+    function loadUserText() {
       const inputVal = userText.value.trim();
-      if (!inputVal) return alert('Please paste some text first!');
+      if (!inputVal) {
+        alert('Please paste some text or open a .txt file first!');
+        return;
+      }
 
-      // Stop any current speech
       stopSpeech();
-
-      // Replace reading panel text
-      textDisplay.innerText = inputVal;
-
-      // Re-build word spans for the new text
+      textDisplay.textContent = inputVal;
       buildWordSpans();
-
-      // Auto-start reading
+      saveState();
       speakFrom(0);
+    }
+
+    btnLoad.addEventListener('click', loadUserText);
+
+    fileInput.addEventListener('change', async () => {
+      const file = fileInput.files[0];
+      if (!file) return;
+      if (!file.name.toLowerCase().endsWith('.txt') && file.type !== 'text/plain') {
+        alert('Please choose a .txt file.');
+        fileInput.value = '';
+        return;
+      }
+
+      try {
+        userText.value = await file.text();
+        userText.dispatchEvent(new Event('input'));
+      } catch (error) {
+        console.error('Unable to read text file:', error);
+        alert('Could not read that file. Please try another .txt file.');
+      }
     });
 
     btnClear.addEventListener('click', () => {
       userText.value = '';
+      saveState();
     });
 
 
@@ -876,7 +984,8 @@
     });
 
 
-    // ── 17. Init: build word spans on page load ───────────
+    // ── 17. Init: restore saved state and build word spans ─
+    restoreState();
     buildWordSpans();
 
   </script>

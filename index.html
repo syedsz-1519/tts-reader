@@ -308,6 +308,13 @@
       border-color: var(--accent);
     }
 
+    .settings-note {
+      grid-column: 1 / -1;
+      color: var(--muted);
+      font-size: 0.8rem;
+      line-height: 1.5;
+    }
+
     .range-value {
       font-family: 'IBM Plex Mono', monospace;
       font-size: 0.7rem;
@@ -562,13 +569,30 @@
           <input type="range" id="pitchSlider" min="0.5" max="2" step="0.1" value="1.0" />
         </div>
 
-        <!-- Voice selector — populated by JS after voices load -->
         <div class="setting-group">
-          <label>Voice</label>
-          <select id="voiceSelect">
-            <option>Loading voices…</option>
+          <label for="languageSelect">Reading language</label>
+          <select id="languageSelect">
+            <option value="en">English</option>
+            <option value="hi">Hindi</option>
+            <option value="hinglish">Hinglish (Roman Hindi)</option>
+            <option value="te">Telugu</option>
+            <option value="teglish">Teglish (Roman Telugu)</option>
+            <option value="ur">Urdu</option>
+            <option value="roman-ur">Roman Urdu</option>
+            <option value="ar">Arabic</option>
           </select>
         </div>
+
+        <div class="setting-group">
+          <label for="voiceSelect">Device voice</label>
+          <select id="voiceSelect">
+            <option value="">Loading voices…</option>
+          </select>
+        </div>
+
+        <p class="settings-note" id="voiceAvailability" role="status" aria-live="polite">
+          Voices are provided by your device or browser. Text translation is not included.
+        </p>
 
       </div>
 
@@ -621,7 +645,9 @@
     const pitchSlider  = document.getElementById('pitchSlider');
     const speedVal     = document.getElementById('speedVal');
     const pitchVal     = document.getElementById('pitchVal');
+    const languageSelect = document.getElementById('languageSelect');
     const voiceSelect  = document.getElementById('voiceSelect');
+    const voiceAvailability = document.getElementById('voiceAvailability');
     const userText     = document.getElementById('userText');
     const btnLoad      = document.getElementById('btnLoad');
     const btnClear     = document.getElementById('btnClear');
@@ -630,6 +656,16 @@
 
     // ── 2. State variables ────────────────────────────────
     const STORAGE_KEY = 'tts-reader-state';
+    const READING_LANGUAGES = {
+      en: { name: 'English', speechLang: 'en-US', voiceLang: 'en' },
+      hi: { name: 'Hindi', speechLang: 'hi-IN', voiceLang: 'hi' },
+      hinglish: { name: 'Hinglish', speechLang: 'hi-IN', voiceLang: 'hi' },
+      te: { name: 'Telugu', speechLang: 'te-IN', voiceLang: 'te' },
+      teglish: { name: 'Teglish', speechLang: 'te-IN', voiceLang: 'te' },
+      ur: { name: 'Urdu', speechLang: 'ur-PK', voiceLang: 'ur' },
+      'roman-ur': { name: 'Roman Urdu', speechLang: 'ur-PK', voiceLang: 'ur' },
+      ar: { name: 'Arabic', speechLang: 'ar-SA', voiceLang: 'ar' }
+    };
     const WORDS_PER_CHUNK = 40;
     const CHARACTERS_PER_CHUNK = 180;
     let words       = [];       // array of all word elements in textDisplay
@@ -647,7 +683,8 @@
           activeText: textDisplay.innerText,
           speed: speedSlider.value,
           pitch: pitchSlider.value,
-          voiceURI: voices.find((voice) => voice.voiceURI === voiceSelect.value)?.voiceURI || savedVoiceURI
+          language: languageSelect.value,
+          voiceURI: voiceSelect.value || savedVoiceURI
         }));
       } catch (error) {
         console.warn('Unable to save reader settings:', error);
@@ -672,10 +709,15 @@
           pitchVal.textContent = parseFloat(savedState.pitch).toFixed(1);
         }
         if (typeof savedState.voiceURI === 'string') savedVoiceURI = savedState.voiceURI;
+        if (typeof savedState.language === 'string' && READING_LANGUAGES[savedState.language]) {
+          languageSelect.value = savedState.language;
+        }
       } catch (error) {
         console.warn('Unable to restore reader settings:', error);
       }
     }
+
+    restoreState();
 
 
     // ── 3. Split text into word <span>s ──────────────────
@@ -708,15 +750,44 @@
     // The browser loads voices asynchronously, so we listen for the event.
     function loadVoices() {
       voices = window.speechSynthesis.getVoices();
+      updateVoiceOptions();
+    }
 
-      if (voices.length === 0) return;
+    function updateVoiceOptions() {
+      const language = READING_LANGUAGES[languageSelect.value];
+      const matchingVoices = voices.filter((voice) =>
+        voice.lang.replace('_', '-').toLowerCase().split('-')[0] === language.voiceLang
+      );
+      const preferredVoice = matchingVoices.find((voice) => voice.voiceURI === savedVoiceURI)
+        || matchingVoices.find((voice) => voice.default)
+        || matchingVoices[0];
 
-      voiceSelect.innerHTML = voices
-        .map((v) => `<option value="${v.voiceURI}">${v.name} (${v.lang})</option>`)
-        .join('');
-      if (savedVoiceURI && voices.some((voice) => voice.voiceURI === savedVoiceURI)) {
-        voiceSelect.value = savedVoiceURI;
+      voiceSelect.replaceChildren();
+      if (matchingVoices.length === 0) {
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = 'No matching device voice';
+        voiceSelect.append(option);
+        voiceAvailability.textContent =
+          `No ${language.name} voice was detected. Add a ${language.name} speech voice in your device settings; your browser may use its default voice meanwhile.`;
+        savedVoiceURI = '';
+        return;
       }
+
+      matchingVoices.forEach((voice) => {
+        const option = document.createElement('option');
+        option.value = voice.voiceURI;
+        option.textContent = `${voice.name} (${voice.lang})${voice.default ? ' — default' : ''}`;
+        voiceSelect.append(option);
+      });
+      voiceSelect.value = preferredVoice.voiceURI;
+      savedVoiceURI = preferredVoice.voiceURI;
+
+      const scriptNote = ['hinglish', 'teglish', 'roman-ur'].includes(languageSelect.value)
+        ? ` ${language.name} uses a ${language.name === 'Hinglish' ? 'Hindi' : language.name === 'Teglish' ? 'Telugu' : 'Urdu'} voice; Roman-script pronunciation depends on your device.`
+        : '';
+      voiceAvailability.textContent =
+        `${matchingVoices.length} ${language.name} device voice${matchingVoices.length === 1 ? '' : 's'} available. Voice quality depends on your device.${scriptNote} Text translation is not included.`;
     }
 
     // This event fires when voices are ready
@@ -781,6 +852,7 @@
       utterance = new SpeechSynthesisUtterance(textToSpeak);
       utterance.rate  = parseFloat(speedSlider.value);
       utterance.pitch = parseFloat(pitchSlider.value);
+      utterance.lang = READING_LANGUAGES[languageSelect.value].speechLang;
 
       const selectedVoice = voices.find((voice) => voice.voiceURI === voiceSelect.value);
       if (selectedVoice) utterance.voice = selectedVoice;
@@ -902,7 +974,16 @@
       if (isPlaying) speakFrom(currentWord);
     });
 
-    voiceSelect.addEventListener('change', saveState);
+    languageSelect.addEventListener('change', () => {
+      updateVoiceOptions();
+      saveState();
+      if (isPlaying) speakFrom(currentWord);
+    });
+    voiceSelect.addEventListener('change', () => {
+      savedVoiceURI = voiceSelect.value;
+      saveState();
+      if (isPlaying) speakFrom(currentWord);
+    });
     userText.addEventListener('input', saveState);
 
     // ── 14. Load user's custom text ───────────────────────
@@ -985,7 +1066,6 @@
 
 
     // ── 17. Init: restore saved state and build word spans ─
-    restoreState();
     buildWordSpans();
 
   </script>
